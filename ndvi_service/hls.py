@@ -8,6 +8,7 @@ from ndvi_service.helper import (
     S30_ALIAS_TO_CODE, open_hls_band, REFLECTANCE_CODES,
     create_quality_mask, scaling, get_alias_to_code, detect_hls_product
 )
+from rioxarray.merge import merge_arrays
 import base64, zlib
 
 """
@@ -230,9 +231,7 @@ def build_farm_cog_bytes_per_index(granules_links: list[list[str]], farm_gdf: gp
 
     out: dict[str, bytes] = {}
     for idx, lst in acc.items():
-        merged = lst[0]
-        for st in lst[1:]:
-            merged = merged.rio.merge(st, method="first")
+        merged = lst[0] if len(lst) == 1 else merge_arrays(lst, method="first", nodata=np.nan)
         out[idx] = _to_cog_bytes(merged)
     return out
 
@@ -360,11 +359,11 @@ def build_mask_payload_per_index(granules_links: list[list[str]],
 
     out: dict[str, dict] = {}
     for idx, lst in acc.items():
-        merged = lst[0]
-        for st in lst[1:]:
-            merged = merged.rio.merge(st, method="first")
-        # enforce dtype/nodata consistently before export
-        merged = merged.astype("float32").rio.write_nodata(-9999.0, encoded=True)
+        if not lst:
+            continue
+        merged = lst[0] if len(lst) == 1 else merge_arrays(lst, method="first", nodata=np.nan)
+        # Enforce float32 + NaN nodata for clean transparency in the browser
+        merged = merged.astype("float32").rio.write_nodata(np.nan, encoded=False)
         out[idx] = _to_payload_from_da(merged, quantize=quantize, scale=scale)
     return out
 
@@ -399,14 +398,27 @@ def build_mask_payloads_and_stats_for_day(
                 acc.setdefault(idx, []).append(da)
 
     for idx, lst in acc.items():
-        merged = lst[0]
-        for st in lst[1:]:
-            merged = merged.rio.merge(st, method="first")
+        if not lst:
+            continue
 
-        merged = merged.astype("float32").rio.write_nodata(-9999.0, encoded=True)
+        # ensure each tile has float and nodata=NaN before merge
+        lst = [da.astype("float32").rio.write_nodata(np.nan, encoded=False) for da in lst]
+
+        # merge with nodata respected
+        merged = lst[0] if len(lst) == 1 else merge_arrays(lst, method="first", nodata=np.nan)
+
+        px = abs(float(merged.rio.resolution()[0]))  # e.g., 30.0
+        farm_clip = farm_gdf.to_crs(merged.rio.crs).copy()
+        farm_clip["geometry"] = farm_clip.geometry.buffer(-0.5 * px)  # try 0.5..1.0 * px
+
+        merged = merged.rio.clip(
+            farm_clip.geometry, crs=merged.rio.crs,
+            all_touched=False, drop=False
+        )
+        merged = merged.astype("float32").rio.write_nodata(np.nan, encoded=False)
+        print("CRS:", merged.rio.crs, "res:", merged.rio.resolution(), "bounds:", merged.rio.bounds())
         payload = _to_payload_from_da(merged, quantize=quantize, scale=scale)
         stats   = _stats_from_da(merged)
-
         per_day[idx] = {"payload": payload, "stats": stats}
 
     return per_day

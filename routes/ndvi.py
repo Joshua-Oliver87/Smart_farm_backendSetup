@@ -20,47 +20,100 @@ from ndvi_service.hls import build_mask_payloads_and_stats_for_day
 
 ndvi_bp = Blueprint("ndvi", __name__)
 
+def _maybe_swap_latlon(x, y):
+    """
+    Return (lon, lat). If input looks like (lat, lon) (second magnitude > 90),
+    swap them. Accepts strings/numbers.
+    """
+    x = float(x); y = float(y)
+    # Expected: lon in [-180,180], lat in [-90,90]
+    if abs(x) <= 90 and abs(y) > 90:
+        # looks like (lat, lon)
+        return y, x
+    return x, y  # already (lon, lat) or ambiguous-but-valid
+
+def _normalize_ring(ring_pairs):
+    """
+    Normalize a ring of pairs into a valid Polygon.
+    - Accept [lon,lat] or [lat,lon] pairs; swap when needed.
+    - Ensure closed ring.
+    """
+    pts = []
+    for p in ring_pairs:
+        if not isinstance(p, (list, tuple)) or len(p) < 2:
+            raise ValueError("Each coordinate must be a [x,y] pair.")
+        lon, lat = _maybe_swap_latlon(p[0], p[1])
+        # basic bounds check
+        if abs(lon) > 180 or abs(lat) > 90:
+            raise ValueError(f"Coordinate out of range: ({lon}, {lat})")
+        pts.append((lon, lat))
+
+    if pts[0] != pts[-1]:
+        pts.append(pts[0])
+
+    poly = Polygon(pts)
+    if not poly.is_valid:
+        raise ValueError("Provided coordinates do not form a valid polygon.")
+    return poly
+
+def _normalize_bbox4(a, b, c, d):
+    """
+    Accept 4-number bbox in either order:
+      - [minLon, minLat, maxLon, maxLat]  (standard)
+      - [minLat, minLon, maxLat, maxLon]  (swapped)
+    Decide by looking at magnitudes (|lon| can be >90, |lat| ≤90).
+    """
+    a = float(a); b = float(b); c = float(c); d = float(d)
+
+    # If a/c look like lats and b/d look like lons, swap interpretation.
+    if max(abs(a), abs(c)) <= 90 and max(abs(b), abs(d)) > 90:
+        minLat, maxLat = sorted([a, c])
+        minLon, maxLon = sorted([b, d])
+    else:
+        # assume a/c are lons and b/d are lats
+        minLon, maxLon = sorted([a, c])
+        minLat, maxLat = sorted([b, d])
+
+    if any(abs(x) > 180 for x in (minLon, maxLon)):
+        raise ValueError("Longitude out of range in bbox.")
+    if any(abs(y) > 90 for y in (minLat, maxLat)):
+        raise ValueError("Latitude out of range in bbox.")
+
+    return box(minLon, minLat, maxLon, maxLat)
+
 def gdf_from_body(body: BaseGeo, crs="EPSG:4326") -> gpd.GeoDataFrame:
-    # 1) GeoJSON still works as-is
+    # 1) GeoJSON
     if body.geojson is not None:
+        # We assume incoming GeoJSON follows lon,lat per spec.
+        # (If you want to “auto-fix” bad GeoJSON too, that’s possible but more invasive.)
         if "type" in body.geojson and body.geojson["type"] == "FeatureCollection":
             return gpd.GeoDataFrame.from_features(body.geojson, crs=crs)
         return gpd.GeoDataFrame.from_features([body.geojson], crs=crs)
 
-    # 2) WKT still works as-is
+    # 2) WKT
     if body.wkt is not None:
         geom = shapely_wkt.loads(body.wkt)
         return gpd.GeoDataFrame({"name": ["geom"]}, geometry=[geom], crs=crs)
 
-    # 3) "bbox" can now be EITHER 4-number bbox OR ring of [x,y] pairs
+    # 3) bbox: either 4-number bbox OR ring of pairs
     if body.bbox is not None:
-        # bbox as 4 numbers: [minx, miny, maxx, maxy]
-        if (len(body.bbox) == 4 and all(isinstance(v, (int, float)) for v in body.bbox)):
-            minx, miny, maxx, maxy = map(float, body.bbox)
-            geom = box(minx, miny, maxx, maxy)
+        # 3a) 4-number bbox
+        if isinstance(body.bbox, (list, tuple)) and len(body.bbox) == 4 and all(
+            isinstance(v, (int, float, str)) for v in body.bbox
+        ):
+            geom = _normalize_bbox4(*body.bbox)
             return gpd.GeoDataFrame({"name": ["bbox"]}, geometry=[geom], crs=crs)
 
-        # bbox as ring: [[x1,y1], [x2,y2], ...]
-        if isinstance(body.bbox, list) and body.bbox and isinstance(body.bbox[0], (list, tuple)):
-            ring = [(float(x), float(y)) for x, y in body.bbox]
-            # ensure closed ring
-            if ring[0] != ring[-1]:
-                ring.append(ring[0])
-            poly = Polygon(ring)
-            if not poly.is_valid:
-                raise ValueError("Provided bbox ring does not form a valid polygon.")
+        # 3b) bbox ring: [[x1,y1], [x2,y2], ...]
+        if isinstance(body.bbox, (list, tuple)) and body.bbox and isinstance(body.bbox[0], (list, tuple)):
+            poly = _normalize_ring(body.bbox)
             return gpd.GeoDataFrame({"name": ["polygon"]}, geometry=[poly], crs=crs)
 
         raise ValueError("bbox must be either [minx,miny,maxx,maxy] or [[x,y], ...]")
 
-    # 4) coords still works as-is (explicit polygon ring)
+    # 4) coords: explicit polygon ring
     if body.coords is not None:
-        ring = [(float(x), float(y)) for x, y in body.coords]
-        if ring[0] != ring[-1]:
-            ring.append(ring[0])
-        poly = Polygon(ring)
-        if not poly.is_valid:
-            raise ValueError("Provided coords do not form a valid polygon.")
+        poly = _normalize_ring(body.coords)
         return gpd.GeoDataFrame({"name": ["polygon"]}, geometry=[poly], crs=crs)
 
     raise ValueError("Provide one of: geojson, wkt, bbox, coords")
