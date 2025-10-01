@@ -8,7 +8,7 @@ def create_app():
     CORS(
         app,
         resources={r"/api/.*": {  # <-- note the .*
-            "origins": ["http://localhost:5173", "http://localhost:8081"]
+            "origins": ["http://localhost:5173", "http://localhost:8081", "http://127.0.0.1:5173"]
         }},
         supports_credentials=True,                 # only if you need cookies
         methods=["GET", "POST", "OPTIONS"],        # allow preflight + POST
@@ -22,4 +22,4 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5050)
+    app.run(host="0.0.0.0",port=5050,debug=True)
